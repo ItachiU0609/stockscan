@@ -72,6 +72,7 @@ def analyze(ticker: str):
     time.sleep(1)
 
     try:
+        yf.base.set_tz_cache_location("/tmp")
         tk   = yf.Ticker(ticker)
         info = tk.info
         hist = tk.history(period="3mo")
