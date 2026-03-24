@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from datetime import datetime, timedelta
 import yfinance as yf
+import time
 
 app = FastAPI(title="Penny Stock Screener")
 
@@ -68,6 +69,7 @@ def moving_average(prices, n):
 @app.get("/api/analyze/{ticker}")
 def analyze(ticker: str):
     ticker = ticker.upper().strip()
+    time.sleep(1)
 
     try:
         tk   = yf.Ticker(ticker)
