@@ -89,16 +89,19 @@ def analyze(ticker: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Price fetch failed: {e}")
 
+    # Log exactly what Alpha Vantage returned for debugging
+    print("Alpha Vantage response keys:", list(daily.keys()))
+    print("Full response:", daily)
+
     if "Time Series (Daily)" not in daily:
-        msg = daily.get("Note") or daily.get("Information") or "No data returned"
-        raise HTTPException(status_code=404, detail=msg)
+        msg = daily.get("Note") or daily.get("Information") or daily.get("message") or str(daily)
+        raise HTTPException(status_code=404, detail=f"Alpha Vantage error: {msg}")
 
     ts = daily["Time Series (Daily)"]
-    dates   = sorted(ts.keys(), reverse=True)[:63]  # ~3 months
+    dates   = sorted(ts.keys(), reverse=True)[:63]
     closes  = [float(ts[d]["4. close"]) for d in dates]
     volumes = [float(ts[d]["5. volume"]) for d in dates]
 
-    # Most recent = index 0 (reverse sorted)
     price      = round(closes[0], 4)
     prev_close = closes[1]
     today_vol  = int(volumes[0])
@@ -107,12 +110,12 @@ def analyze(ticker: str):
     price_chg  = (price - prev_close) / prev_close if prev_close else 0
     price_5d   = closes[5] if len(closes) >= 6 else closes[-1]
     gain_5d    = (price - price_5d) / price_5d if price_5d else 0
-    rsi        = compute_rsi(list(reversed(closes)))  # oldest first for RSI
+    rsi        = compute_rsi(list(reversed(closes)))
     ma10       = moving_average(list(reversed(closes)), 10)
     ma30       = moving_average(list(reversed(closes)), 30)
 
     # ── Company overview ─────────────────────────
-    time.sleep(1)  # avoid hitting rate limit between calls
+    time.sleep(1)
     try:
         overview = av_get({
             "function": "OVERVIEW",
@@ -122,7 +125,6 @@ def analyze(ticker: str):
     except Exception:
         market_cap = 0
 
-    # Alpha Vantage doesn't provide bid/ask on free tier
     spread_pct = 0.0
 
     # ── News ─────────────────────────────────────
@@ -145,7 +147,6 @@ def analyze(ticker: str):
 
     catalyst_present = len(recent_news) > 0
 
-    # ── Signal logic ─────────────────────────────
     s1_price  = price < MAX_PRICE
     s1_vol    = avg_vol_30 > MIN_AVG_VOLUME
     s1_mcap   = market_cap > MIN_MARKET_CAP
@@ -160,7 +161,6 @@ def analyze(ticker: str):
     rsi_ok     = (RSI_LOW <= rsi <= RSI_HIGH) if rsi else False
     step3_pass = above_ma10 and ma10_vs_30 and rsi_ok
 
-    spread_ok = True  # no bid/ask on free tier, skip this check
     no_pump   = gain_5d <= PUMP_THRESHOLD
     disqualifiers = []
     if not no_pump:
@@ -219,7 +219,7 @@ def analyze(ticker: str):
                 "passed": len(disqualifiers) == 0,
                 "disqualifiers": disqualifiers,
                 "checks": {
-                    "spread_ok": spread_ok,
+                    "spread_ok": True,
                     "no_pump":   no_pump,
                 }
             }
