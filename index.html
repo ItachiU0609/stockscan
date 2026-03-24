@@ -99,19 +99,15 @@
       <div class="tagline">Penny Stock Screener</div>
     </div>
   </div>
-
   <div class="search-wrap">
     <input class="ticker-input" id="tickerInput" type="text" maxlength="6" placeholder="TICKER…" autocomplete="off" autocorrect="off" spellcheck="false"/>
     <button class="scan-btn" id="scanBtn" onclick="runScan()">SCAN</button>
   </div>
-
   <div class="loading" id="loading">
     <div class="spinner"></div>
     <div class="loading-text">SCANNING MARKET DATA…</div>
   </div>
-
   <div class="error-box" id="errorBox"></div>
-
   <div class="result" id="result">
     <div class="verdict" id="verdict">
       <div class="verdict-icon" id="verdictIcon"></div>
@@ -171,6 +167,22 @@ function ma(arr,n){
   return parseFloat((arr.slice(-n).reduce((a,b)=>a+b,0)/n).toFixed(4));
 }
 
+// Try multiple proxies in order until one works
+async function fetchWithProxy(url) {
+  const proxies = [
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    `https://proxy.cors.sh/${url}`,
+  ];
+  for (const proxy of proxies) {
+    try {
+      const r = await fetch(proxy, { signal: AbortSignal.timeout(8000) });
+      if (r.ok) return r;
+    } catch {}
+  }
+  throw new Error('Could not connect to market data. Please try again.');
+}
+
 async function runScan(){
   const ticker=$('tickerInput').value.trim().toUpperCase();
   if(!ticker){$('tickerInput').focus();return;}
@@ -180,27 +192,23 @@ async function runScan(){
   $('scanBtn').disabled=true;
 
   try {
-    // Use a CORS proxy to fetch from Yahoo Finance
-    const proxy = 'https://corsproxy.io/?';
-    const chartUrl = proxy + encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=3mo`);
-    const quoteUrl = proxy + encodeURIComponent(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${ticker}`);
+    const chartUrl=`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=3mo`;
+    const quoteUrl=`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${ticker}`;
 
     const [chartRes, quoteRes] = await Promise.all([
-      fetch(chartUrl),
-      fetch(quoteUrl)
+      fetchWithProxy(chartUrl),
+      fetchWithProxy(quoteUrl)
     ]);
-
-    if(!chartRes.ok) throw new Error(`Could not load data for ${ticker}`);
 
     const chartJson = await chartRes.json();
     const quoteJson = await quoteRes.json().catch(()=>({quoteResponse:{result:[]}}));
 
     const result = chartJson?.chart?.result?.[0];
-    if(!result) throw new Error(`No price data found for ${ticker}`);
+    if(!result) throw new Error(`No price data found for ${ticker}. Check the ticker symbol.`);
 
     const closes  = result.indicators.quote[0].close.filter(v=>v!=null);
     const volumes = result.indicators.quote[0].volume.filter(v=>v!=null);
-    if(closes.length<2) throw new Error('Not enough price history');
+    if(closes.length<2) throw new Error('Not enough price history for this ticker.');
 
     const quote    = quoteJson?.quoteResponse?.result?.[0] || {};
     const price    = parseFloat(closes[closes.length-1].toFixed(4));
@@ -219,30 +227,26 @@ async function runScan(){
     const ask      = quote.ask||price;
     const spread   = ask>0?(ask-bid)/ask:0;
 
-    // Signal logic
-    const s1p=price<MAX_PRICE, s1v=avgVol>MIN_AVG_VOL, s1m=mcap>MIN_MCAP;
+    const s1p=price<MAX_PRICE,s1v=avgVol>MIN_AVG_VOL,s1m=mcap>MIN_MCAP;
     const screen=s1p&&s1v&&s1m;
-    const vspike=volRatio>=VOL_SPIKE, pup=pchg>=MIN_CHG, step2=vspike&&pup;
-    const ama10=ma10?price>ma10:false, m1030=ma10&&ma30v?ma10>ma30v:false, rsiok=rsi?rsi>=RSI_LO&&rsi<=RSI_HI:false;
+    const vspike=volRatio>=VOL_SPIKE,pup=pchg>=MIN_CHG,step2=vspike&&pup;
+    const ama10=ma10?price>ma10:false,m1030=ma10&&ma30v?ma10>ma30v:false,rsiok=rsi?rsi>=RSI_LO&&rsi<=RSI_HI:false;
     const step3=ama10&&m1030&&rsiok;
-    const spok=spread<=0.05, nopump=gain5d<=PUMP;
+    const spok=spread<=0.05,nopump=gain5d<=PUMP;
     const disq=[];
-    if(!spok) disq.push(`Bid/ask spread too wide (${(spread*100).toFixed(1)}%)`);
-    if(!nopump) disq.push(`Possible pump-and-dump (+${(gain5d*100).toFixed(0)}% in 5 days)`);
+    if(!spok)disq.push(`Bid/ask spread too wide (${(spread*100).toFixed(1)}%)`);
+    if(!nopump)disq.push(`Possible pump-and-dump (+${(gain5d*100).toFixed(0)}% in 5 days)`);
 
     let sig=0;
     if(screen){if(step2)sig+=2;if(step3)sig+=2;}
 
-    // News via RSS (no CORS issues)
     let news=[];
     try{
-      const rssUrl=proxy+encodeURIComponent(`https://feeds.finance.yahoo.com/rss/2.0/headline?s=${ticker}&region=US&lang=en-US`);
-      const rr=await fetch(rssUrl);
+      const rssUrl=`https://feeds.finance.yahoo.com/rss/2.0/headline?s=${ticker}&region=US&lang=en-US`;
+      const rr=await fetchWithProxy(rssUrl);
       const txt=await rr.text();
-      const parser=new DOMParser();
-      const xml=parser.parseFromString(txt,'text/xml');
-      const items=Array.from(xml.querySelectorAll('item')).slice(0,3);
-      news=items.map(i=>({
+      const xml=new DOMParser().parseFromString(txt,'text/xml');
+      news=Array.from(xml.querySelectorAll('item')).slice(0,3).map(i=>({
         title:i.querySelector('title')?.textContent||'',
         url:i.querySelector('link')?.textContent||''
       }));
@@ -250,7 +254,8 @@ async function runScan(){
     }catch{}
 
     const buy=sig>=5&&disq.length===0&&screen;
-    render({ticker,price,pchg,mcap,avgVol,todayVol,volRatio,rsi,ma10,ma30:ma30v,spread,gain5d,screen,step2,step3,vspike,pup,ama10,m1030,rsiok,spok,nopump,disq,sig,news,buy,trade:{entry:price,stop:parseFloat((price*(1-SL)).toFixed(4)),target:parseFloat((price*(1+TP)).toFixed(4))}});
+    render({ticker,price,pchg,mcap,avgVol,todayVol,volRatio,rsi,ma10,ma30:ma30v,spread,gain5d,screen,step2,step3,vspike,pup,ama10,m1030,rsiok,spok,nopump,disq,sig,news,buy,
+      trade:{entry:price,stop:parseFloat((price*(1-SL)).toFixed(4)),target:parseFloat((price*(1+TP)).toFixed(4))}});
     $('result').classList.add('active');
     $('result').scrollIntoView({behavior:'smooth',block:'start'});
 
@@ -264,7 +269,7 @@ async function runScan(){
 }
 
 function render(d){
-  const v=$('verdict'); v.className='verdict';
+  const v=$('verdict');v.className='verdict';
   if(d.buy){v.classList.add('buy');$('verdictIcon').textContent='★';$('verdictLabel').textContent='BUY SIGNAL';$('verdictSub').textContent=`${d.sig}/7 pts · All filters passed`;}
   else if(!d.screen){v.classList.add('no-buy');$('verdictIcon').textContent='✘';$('verdictLabel').textContent='NOT QUALIFIED';$('verdictSub').textContent='Failed initial penny stock screen';}
   else if(d.disq.length>0){v.classList.add('no-buy');$('verdictIcon').textContent='✘';$('verdictLabel').textContent='DISQUALIFIED';$('verdictSub').textContent=`${d.disq.length} risk flag(s) detected`;}
