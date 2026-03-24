@@ -8,6 +8,7 @@
 <meta name="apple-mobile-web-app-title" content="StockScan"/>
 <title>StockScan — Penny Stock Screener</title>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@300;400;600;700&family=Barlow+Condensed:wght@700;900&display=swap" rel="stylesheet"/>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
@@ -62,10 +63,15 @@
   .price-change { font-family: var(--mono); font-size: 15px; font-weight: 600; }
   .price-change.pos { color: var(--green); } .price-change.neg { color: var(--red); }
   .ticker-name { font-family: var(--cond); font-size: 13px; font-weight: 700; letter-spacing: 2px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 12px; }
-  .signal-section { margin-top: 4px; }
+  .signal-section { margin-top: 12px; }
   .signal-label { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 11px; color: var(--text-dim); letter-spacing: 1px; margin-bottom: 6px; text-transform: uppercase; }
   .signal-bar-track { height: 8px; background: var(--surface2); border-radius: 4px; overflow: hidden; }
   .signal-bar-fill { height: 100%; border-radius: 4px; transition: width 0.8s cubic-bezier(0.16,1,0.3,1); background: linear-gradient(90deg, var(--green-dim), var(--green)); box-shadow: 0 0 8px rgba(0,230,118,0.4); }
+  /* Chart */
+  .chart-wrap { position: relative; width: 100%; height: 180px; margin-top: 16px; }
+  .chart-legend { display: flex; gap: 14px; margin-top: 8px; }
+  .chart-legend-item { display: flex; align-items: center; gap: 5px; font-family: var(--mono); font-size: 10px; color: var(--text-dim); }
+  .legend-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
   .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .stat { background: var(--surface2); border-radius: 8px; padding: 10px 12px; }
   .stat-label { font-family: var(--mono); font-size: 9px; color: var(--text-dim); letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 4px; }
@@ -114,17 +120,28 @@
       <div class="verdict-label" id="verdictLabel"></div>
       <div class="verdict-sub" id="verdictSub"></div>
     </div>
+
+    <!-- Price + Chart Card -->
     <div class="card">
       <div class="ticker-name" id="tickerDisplay"></div>
       <div class="price-row">
         <div class="price-big" id="priceDisplay"></div>
         <div class="price-change" id="priceChange"></div>
       </div>
+      <div class="chart-wrap">
+        <canvas id="priceChart"></canvas>
+      </div>
+      <div class="chart-legend">
+        <div class="chart-legend-item"><div class="legend-dot" style="background:#00e5ff"></div>Price</div>
+        <div class="chart-legend-item"><div class="legend-dot" style="background:#00e676"></div>MA10</div>
+        <div class="chart-legend-item"><div class="legend-dot" style="background:#ffca28"></div>MA30</div>
+      </div>
       <div class="signal-section">
         <div class="signal-label"><span>SIGNAL STRENGTH</span><span id="signalScore"></span></div>
         <div class="signal-bar-track"><div class="signal-bar-fill" id="signalBar" style="width:0%"></div></div>
       </div>
     </div>
+
     <div class="card">
       <div class="section-title">Market Data</div>
       <div class="stats-grid" id="statsGrid"></div>
@@ -150,177 +167,204 @@
 </div>
 
 <script>
-const MAX_PRICE=5,MIN_AVG_VOL=500000,MIN_MCAP=10000000,VOL_SPIKE=2.5,MIN_CHG=0.03,RSI_LO=40,RSI_HI=65,PUMP=0.5,SL=0.15,TP=0.3;
+// ── Config — point to your Render backend ────────
+const API_BASE = 'https://stockscan-2kta.onrender.com'; // ← UPDATE THIS to your Render URL
+
 const $=id=>document.getElementById(id);
 const fmtM=n=>n>=1e9?`$${(n/1e9).toFixed(1)}B`:n>=1e6?`$${(n/1e6).toFixed(1)}M`:n>0?`$${n.toLocaleString()}`:'N/A';
 
-function calcRSI(c,p=14){
-  if(c.length<p+1)return null;
-  let g=[],l=[];
-  for(let i=1;i<c.length;i++){const d=c[i]-c[i-1];g.push(Math.max(d,0));l.push(Math.max(-d,0));}
-  const ag=g.slice(-p).reduce((a,b)=>a+b,0)/p;
-  const al=l.slice(-p).reduce((a,b)=>a+b,0)/p;
-  return al===0?100:Math.round(100-(100/(1+ag/al)));
-}
-function ma(arr,n){
-  if(arr.length<n)return null;
-  return parseFloat((arr.slice(-n).reduce((a,b)=>a+b,0)/n).toFixed(4));
+let chartInstance = null;
+
+function buildMA(closes, n) {
+  return closes.map((_, i) => i >= n - 1
+    ? parseFloat((closes.slice(i - n + 1, i + 1).reduce((a,b)=>a+b,0) / n).toFixed(4))
+    : null
+  );
 }
 
-// Try multiple proxies in order until one works
-async function fetchWithProxy(url) {
-  const proxies = [
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-    `https://corsproxy.io/?${encodeURIComponent(url)}`,
-    `https://proxy.cors.sh/${url}`,
-  ];
-  for (const proxy of proxies) {
-    try {
-      const r = await fetch(proxy, { signal: AbortSignal.timeout(8000) });
-      if (r.ok) return r;
-    } catch {}
-  }
-  throw new Error('Could not connect to market data. Please try again.');
+function renderChart(data) {
+  const closes = data.chart_closes;
+  const labels = data.chart_dates;
+  if (!closes || closes.length === 0) return;
+
+  const ma10 = buildMA(closes, 10);
+  const ma30 = buildMA(closes, 30);
+
+  if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+
+  const ctx = $('priceChart').getContext('2d');
+
+  // Gradient fill under price line
+  const gradient = ctx.createLinearGradient(0, 0, 0, 180);
+  gradient.addColorStop(0, 'rgba(0,229,255,0.15)');
+  gradient.addColorStop(1, 'rgba(0,229,255,0)');
+
+  chartInstance = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Price',
+          data: closes,
+          borderColor: '#00e5ff',
+          borderWidth: 2,
+          backgroundColor: gradient,
+          fill: true,
+          pointRadius: 0,
+          tension: 0.3,
+        },
+        {
+          label: 'MA10',
+          data: ma10,
+          borderColor: '#00e676',
+          borderWidth: 1.5,
+          borderDash: [4, 3],
+          fill: false,
+          pointRadius: 0,
+          tension: 0.3,
+        },
+        {
+          label: 'MA30',
+          data: ma30,
+          borderColor: '#ffca28',
+          borderWidth: 1.5,
+          borderDash: [4, 3],
+          fill: false,
+          pointRadius: 0,
+          tension: 0.3,
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#0d1520',
+          borderColor: 'rgba(0,200,120,0.3)',
+          borderWidth: 1,
+          titleColor: '#5a7a8a',
+          bodyColor: '#cdd9e5',
+          titleFont: { family: "'Share Tech Mono'" },
+          bodyFont: { family: "'Share Tech Mono'" },
+          callbacks: {
+            label: ctx => ctx.parsed.y != null ? ` $${ctx.parsed.y.toFixed(4)}` : ''
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { color: 'rgba(0,200,120,0.05)' },
+          ticks: {
+            color: '#5a7a8a',
+            font: { family: "'Share Tech Mono'", size: 9 },
+            maxTicksLimit: 6,
+            maxRotation: 0,
+          }
+        },
+        y: {
+          position: 'right',
+          grid: { color: 'rgba(0,200,120,0.05)' },
+          ticks: {
+            color: '#5a7a8a',
+            font: { family: "'Share Tech Mono'", size: 9 },
+            maxTicksLimit: 5,
+            callback: v => `$${v.toFixed(3)}`
+          }
+        }
+      }
+    }
+  });
 }
 
-async function runScan(){
-  const ticker=$('tickerInput').value.trim().toUpperCase();
-  if(!ticker){$('tickerInput').focus();return;}
+async function runScan() {
+  const ticker = $('tickerInput').value.trim().toUpperCase();
+  if (!ticker) { $('tickerInput').focus(); return; }
+
   $('result').classList.remove('active');
   $('errorBox').classList.remove('active');
   $('loading').classList.add('active');
-  $('scanBtn').disabled=true;
+  $('scanBtn').disabled = true;
 
   try {
-    const chartUrl=`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=3mo`;
-    const quoteUrl=`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${ticker}`;
-
-    const [chartRes, quoteRes] = await Promise.all([
-      fetchWithProxy(chartUrl),
-      fetchWithProxy(quoteUrl)
-    ]);
-
-    const chartJson = await chartRes.json();
-    const quoteJson = await quoteRes.json().catch(()=>({quoteResponse:{result:[]}}));
-
-    const result = chartJson?.chart?.result?.[0];
-    if(!result) throw new Error(`No price data found for ${ticker}. Check the ticker symbol.`);
-
-    const closes  = result.indicators.quote[0].close.filter(v=>v!=null);
-    const volumes = result.indicators.quote[0].volume.filter(v=>v!=null);
-    if(closes.length<2) throw new Error('Not enough price history for this ticker.');
-
-    const quote    = quoteJson?.quoteResponse?.result?.[0] || {};
-    const price    = parseFloat(closes[closes.length-1].toFixed(4));
-    const prev     = closes[closes.length-2];
-    const todayVol = volumes[volumes.length-1];
-    const avgVol   = volumes.slice(-30).reduce((a,b)=>a+b,0)/Math.min(volumes.length,30);
-    const volRatio = parseFloat((todayVol/avgVol).toFixed(2));
-    const pchg     = (price-prev)/prev;
-    const p5d      = closes.length>=6?closes[closes.length-6]:closes[0];
-    const gain5d   = (price-p5d)/p5d;
-    const rsi      = calcRSI(closes);
-    const ma10     = ma(closes,10);
-    const ma30v    = ma(closes,30);
-    const mcap     = quote.marketCap||0;
-    const bid      = quote.bid||0;
-    const ask      = quote.ask||price;
-    const spread   = ask>0?(ask-bid)/ask:0;
-
-    const s1p=price<MAX_PRICE,s1v=avgVol>MIN_AVG_VOL,s1m=mcap>MIN_MCAP;
-    const screen=s1p&&s1v&&s1m;
-    const vspike=volRatio>=VOL_SPIKE,pup=pchg>=MIN_CHG,step2=vspike&&pup;
-    const ama10=ma10?price>ma10:false,m1030=ma10&&ma30v?ma10>ma30v:false,rsiok=rsi?rsi>=RSI_LO&&rsi<=RSI_HI:false;
-    const step3=ama10&&m1030&&rsiok;
-    const spok=spread<=0.05,nopump=gain5d<=PUMP;
-    const disq=[];
-    if(!spok)disq.push(`Bid/ask spread too wide (${(spread*100).toFixed(1)}%)`);
-    if(!nopump)disq.push(`Possible pump-and-dump (+${(gain5d*100).toFixed(0)}% in 5 days)`);
-
-    let sig=0;
-    if(screen){if(step2)sig+=2;if(step3)sig+=2;}
-
-    let news=[];
-    try{
-      const rssUrl=`https://feeds.finance.yahoo.com/rss/2.0/headline?s=${ticker}&region=US&lang=en-US`;
-      const rr=await fetchWithProxy(rssUrl);
-      const txt=await rr.text();
-      const xml=new DOMParser().parseFromString(txt,'text/xml');
-      news=Array.from(xml.querySelectorAll('item')).slice(0,3).map(i=>({
-        title:i.querySelector('title')?.textContent||'',
-        url:i.querySelector('link')?.textContent||''
-      }));
-      if(news.length>0)sig+=3;
-    }catch{}
-
-    const buy=sig>=5&&disq.length===0&&screen;
-    render({ticker,price,pchg,mcap,avgVol,todayVol,volRatio,rsi,ma10,ma30:ma30v,spread,gain5d,screen,step2,step3,vspike,pup,ama10,m1030,rsiok,spok,nopump,disq,sig,news,buy,
-      trade:{entry:price,stop:parseFloat((price*(1-SL)).toFixed(4)),target:parseFloat((price*(1+TP)).toFixed(4))}});
+    const res = await fetch(`${API_BASE}/api/analyze/${ticker}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Unknown error');
+    render(data);
     $('result').classList.add('active');
-    $('result').scrollIntoView({behavior:'smooth',block:'start'});
-
-  } catch(err){
-    $('errorBox').textContent=`⚠ ${err.message}`;
+    $('result').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch(err) {
+    $('errorBox').textContent = `⚠ ${err.message}`;
     $('errorBox').classList.add('active');
   } finally {
     $('loading').classList.remove('active');
-    $('scanBtn').disabled=false;
+    $('scanBtn').disabled = false;
   }
 }
 
-function render(d){
-  const v=$('verdict');v.className='verdict';
-  if(d.buy){v.classList.add('buy');$('verdictIcon').textContent='★';$('verdictLabel').textContent='BUY SIGNAL';$('verdictSub').textContent=`${d.sig}/7 pts · All filters passed`;}
-  else if(!d.screen){v.classList.add('no-buy');$('verdictIcon').textContent='✘';$('verdictLabel').textContent='NOT QUALIFIED';$('verdictSub').textContent='Failed initial penny stock screen';}
-  else if(d.disq.length>0){v.classList.add('no-buy');$('verdictIcon').textContent='✘';$('verdictLabel').textContent='DISQUALIFIED';$('verdictSub').textContent=`${d.disq.length} risk flag(s) detected`;}
-  else{v.classList.add('weak');$('verdictIcon').textContent='◎';$('verdictLabel').textContent='SIGNAL WEAK';$('verdictSub').textContent=`${d.sig}/7 pts · Need ≥5`;}
+function render(d) {
+  const v = $('verdict'); v.className = 'verdict';
+  if (d.buy_signal) { v.classList.add('buy'); $('verdictIcon').textContent='★'; $('verdictLabel').textContent='BUY SIGNAL'; $('verdictSub').textContent=`${d.signal_strength}/7 pts · All filters passed`; }
+  else if (!d.steps.screen.passed) { v.classList.add('no-buy'); $('verdictIcon').textContent='✘'; $('verdictLabel').textContent='NOT QUALIFIED'; $('verdictSub').textContent='Failed initial penny stock screen'; }
+  else if (d.steps.risk.disqualifiers.length > 0) { v.classList.add('no-buy'); $('verdictIcon').textContent='✘'; $('verdictLabel').textContent='DISQUALIFIED'; $('verdictSub').textContent=`${d.steps.risk.disqualifiers.length} risk flag(s) detected`; }
+  else { v.classList.add('weak'); $('verdictIcon').textContent='◎'; $('verdictLabel').textContent='SIGNAL WEAK'; $('verdictSub').textContent=`${d.signal_strength}/7 pts · Need ≥5`; }
 
-  $('tickerDisplay').textContent=d.ticker;
-  $('priceDisplay').textContent=`$${d.price.toFixed(4)}`;
-  const pc=$('priceChange');
-  pc.textContent=`${d.pchg>=0?'+':''}${(d.pchg*100).toFixed(2)}%`;
-  pc.className='price-change '+(d.pchg>=0?'pos':'neg');
-  $('signalScore').textContent=`${d.sig} / 7 pts`;
-  setTimeout(()=>{$('signalBar').style.width=Math.round((d.sig/7)*100)+'%';},50);
+  $('tickerDisplay').textContent = d.ticker;
+  $('priceDisplay').textContent = `$${d.price.toFixed(4)}`;
+  const pc = $('priceChange');
+  pc.textContent = `${d.price_change_pct >= 0 ? '+' : ''}${d.price_change_pct}%`;
+  pc.className = 'price-change ' + (d.price_change_pct >= 0 ? 'pos' : 'neg');
 
-  $('statsGrid').innerHTML=[
-    {l:'Market Cap',v:fmtM(d.mcap),c:''},
-    {l:'RSI (14)',v:d.rsi??'N/A',c:d.rsi>=40&&d.rsi<=65?'green':d.rsi>65?'red':'yellow'},
-    {l:'Vol Ratio',v:`${d.volRatio}x`,c:d.volRatio>=2.5?'green':''},
-    {l:'5-Day Gain',v:`${d.gain5d>=0?'+':''}${(d.gain5d*100).toFixed(1)}%`,c:d.gain5d>0.5?'red':d.gain5d>0.1?'green':''},
-    {l:'Spread',v:`${(d.spread*100).toFixed(2)}%`,c:d.spread>0.05?'red':'green'},
-    {l:'Avg Vol 30D',v:`${(d.avgVol/1e6).toFixed(1)}M`,c:'cyan'},
-  ].map(s=>`<div class="stat"><div class="stat-label">${s.l}</div><div class="stat-value ${s.c}">${s.v}</div></div>`).join('');
+  // Render chart
+  renderChart(d);
 
-  const steps=[
-    {name:'Initial Screen',detail:`Price $${d.price} · AvgVol ${(d.avgVol/1000).toFixed(0)}K`,passed:d.screen,pts:0},
-    {name:'Volume Surge',detail:`${d.volRatio}x spike · ${(d.pchg*100).toFixed(2)}% move`,passed:d.step2,pts:2},
-    {name:'Price Momentum',detail:`MA10=$${d.ma10??'N/A'} · MA30=$${d.ma30??'N/A'} · RSI=${d.rsi??'N/A'}`,passed:d.step3,pts:2},
-    {name:'News Catalyst',detail:d.news.length>0?`${d.news.length} article(s) found`:'No recent news',passed:d.news.length>0,pts:3},
-    {name:'Risk Filters',detail:d.disq.length===0?'No disqualifiers':d.disq.join('; '),passed:d.disq.length===0,pts:0},
+  $('signalScore').textContent = `${d.signal_strength} / 7 pts`;
+  setTimeout(() => { $('signalBar').style.width = Math.round((d.signal_strength / 7) * 100) + '%'; }, 50);
+
+  $('statsGrid').innerHTML = [
+    { l: 'Market Cap',  v: fmtM(d.market_cap), c: '' },
+    { l: 'RSI (14)',    v: d.rsi ?? 'N/A', c: d.rsi >= 40 && d.rsi <= 65 ? 'green' : d.rsi > 65 ? 'red' : 'yellow' },
+    { l: 'Vol Ratio',   v: `${d.volume_ratio}x`, c: d.volume_ratio >= 2.5 ? 'green' : '' },
+    { l: '5-Day Gain',  v: `${d.gain_5d_pct >= 0 ? '+' : ''}${d.gain_5d_pct}%`, c: d.gain_5d_pct > 50 ? 'red' : d.gain_5d_pct > 10 ? 'green' : '' },
+    { l: 'Spread',      v: `${d.spread_pct}%`, c: d.spread_pct > 5 ? 'red' : 'green' },
+    { l: 'Avg Vol 30D', v: `${(d.avg_volume_30d / 1e6).toFixed(1)}M`, c: 'cyan' },
+  ].map(s => `<div class="stat"><div class="stat-label">${s.l}</div><div class="stat-value ${s.c}">${s.v}</div></div>`).join('');
+
+  const steps = [
+    { name: 'Initial Screen',  detail: `Price $${d.price} · AvgVol ${(d.avg_volume_30d/1000).toFixed(0)}K`, passed: d.steps.screen.passed, pts: 0 },
+    { name: 'Volume Surge',    detail: `${d.volume_ratio}x spike · ${d.price_change_pct}% move`, passed: d.steps.volume_surge.passed, pts: 2 },
+    { name: 'Price Momentum',  detail: `MA10=$${d.ma10??'N/A'} · MA30=$${d.ma30??'N/A'} · RSI=${d.rsi??'N/A'}`, passed: d.steps.momentum.passed, pts: 2 },
+    { name: 'News Catalyst',   detail: d.steps.catalyst.news.length > 0 ? `${d.steps.catalyst.news.length} article(s) found` : 'No recent news', passed: d.steps.catalyst.passed, pts: 3 },
+    { name: 'Risk Filters',    detail: d.steps.risk.disqualifiers.length === 0 ? 'No disqualifiers' : d.steps.risk.disqualifiers.join('; '), passed: d.steps.risk.passed, pts: 0 },
   ];
-  $('stepsContainer').innerHTML=steps.map(s=>`
+
+  $('stepsContainer').innerHTML = steps.map(s => `
     <div class="step">
-      <div style="font-size:16px;flex-shrink:0;margin-top:1px">${s.passed?'✅':'❌'}</div>
+      <div style="font-size:16px;flex-shrink:0;margin-top:1px">${s.passed ? '✅' : '❌'}</div>
       <div class="step-body"><div class="step-name">${s.name}</div><div class="step-detail">${s.detail}</div></div>
-      ${s.pts>0?`<div class="step-pts ${s.passed?'earned':'zero'}">${s.passed?'+'+s.pts:'0'} pts</div>`:''}
+      ${s.pts > 0 ? `<div class="step-pts ${s.passed ? 'earned' : 'zero'}">${s.passed ? '+' + s.pts : '0'} pts</div>` : ''}
     </div>`).join('');
 
-  if(d.disq.length>0){$('disqCard').style.display='';$('disqContainer').innerHTML=d.disq.map(x=>`<div class="disq-item">⚠ ${x}</div>`).join('');}
-  else $('disqCard').style.display='none';
+  const disqs = d.steps.risk.disqualifiers;
+  if (disqs.length > 0) { $('disqCard').style.display = ''; $('disqContainer').innerHTML = disqs.map(x => `<div class="disq-item">⚠ ${x}</div>`).join(''); }
+  else $('disqCard').style.display = 'none';
 
-  $('tradeRow').innerHTML=`
+  $('tradeRow').innerHTML = `
     <div><div class="trade-label">Entry</div><div class="trade-value entry">$${d.trade.entry.toFixed(4)}</div></div>
-    <div><div class="trade-label">Stop Loss</div><div class="trade-value stop">$${d.trade.stop.toFixed(4)}</div></div>
-    <div><div class="trade-label">Target</div><div class="trade-value target">$${d.trade.target.toFixed(4)}</div></div>`;
+    <div><div class="trade-label">Stop Loss</div><div class="trade-value stop">$${d.trade.stop_loss.toFixed(4)}</div></div>
+    <div><div class="trade-label">Target</div><div class="trade-value target">$${d.trade.take_profit.toFixed(4)}</div></div>`;
 
-  if(d.news.length>0){
-    $('newsCard').style.display='';
-    $('newsContainer').innerHTML=d.news.map(n=>`<div class="news-item"><a class="news-title" href="${n.url}" target="_blank">${n.title}</a></div>`).join('');
-  } else $('newsCard').style.display='none';
+  const news = d.steps.catalyst.news;
+  if (news.length > 0) {
+    $('newsCard').style.display = '';
+    $('newsContainer').innerHTML = news.map(n => `<div class="news-item"><a class="news-title" href="${n.url}" target="_blank">${n.title}</a></div>`).join('');
+  } else $('newsCard').style.display = 'none';
 }
 
-$('tickerInput').addEventListener('keydown',e=>{if(e.key==='Enter')runScan();});
+$('tickerInput').addEventListener('keydown', e => { if (e.key === 'Enter') runScan(); });
 </script>
 </body>
 </html>

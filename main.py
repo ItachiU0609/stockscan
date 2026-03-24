@@ -27,12 +27,8 @@ app.mount("/static", StaticFiles(directory="."), name="static")
 def root():
     return FileResponse("index.html")
 
-
-# ── Config ──────────────────────────────────────
 FINNHUB_KEY        = "d70uq09r01ql6rg0o0a0d70uq09r01ql6rg0o0ag"
 FINNHUB_BASE       = "https://finnhub.io/api/v1"
-
-# ── Thresholds ──────────────────────────────────
 MAX_PRICE          = 5.00
 MIN_AVG_VOLUME     = 500_000
 MIN_MARKET_CAP     = 10_000_000
@@ -77,7 +73,6 @@ def moving_average(prices, n):
 def analyze(ticker: str):
     ticker = ticker.upper().strip()
 
-    # ── Quote (current price, volume, market cap) ──
     try:
         quote = fh("quote", {"symbol": ticker})
     except Exception as e:
@@ -91,24 +86,22 @@ def analyze(ticker: str):
     price      = round(price, 4)
     price_chg  = (price - prev_close) / prev_close if prev_close else 0
 
-    # ── Candles (90 days of daily data) ────────────
     try:
-        end   = int(datetime.now().timestamp())
-        start = int((datetime.now() - timedelta(days=120)).timestamp())
-        candles = fh("stock/candle", {
-            "symbol": ticker,
-            "resolution": "D",
-            "from": start,
-            "to": end
-        })
+        end     = int(datetime.now().timestamp())
+        start   = int((datetime.now() - timedelta(days=120)).timestamp())
+        candles = fh("stock/candle", {"symbol": ticker, "resolution": "D", "from": start, "to": end})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Candle fetch failed: {e}")
 
     if candles.get("s") != "ok" or not candles.get("c"):
         raise HTTPException(status_code=404, detail=f"No price history for {ticker}")
 
-    closes  = candles["c"]
-    volumes = candles["v"]
+    closes     = candles["c"]
+    volumes    = candles["v"]
+    timestamps = candles["t"]
+
+    # Format dates for chart labels
+    chart_dates = [datetime.fromtimestamp(t).strftime("%b %d") for t in timestamps]
 
     today_vol  = int(volumes[-1])
     avg_vol_30 = sum(volumes[-30:]) / min(len(volumes), 30)
@@ -119,17 +112,15 @@ def analyze(ticker: str):
     ma10       = moving_average(closes, 10)
     ma30       = moving_average(closes, 30)
 
-    # ── Company profile (market cap) ───────────────
     try:
-        profile  = fh("stock/profile2", {"symbol": ticker})
+        profile    = fh("stock/profile2", {"symbol": ticker})
         market_cap = (profile.get("marketCapitalization") or 0) * 1_000_000
     except Exception:
         market_cap = 0
 
-    # ── News ───────────────────────────────────────
     try:
-        today     = datetime.now().strftime("%Y-%m-%d")
-        week_ago  = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        today    = datetime.now().strftime("%Y-%m-%d")
+        week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         news_data = fh("company-news", {"symbol": ticker, "from": week_ago, "to": today})
         recent_news = [
             {"title": n.get("headline", ""), "url": n.get("url", "")}
@@ -140,7 +131,6 @@ def analyze(ticker: str):
 
     catalyst_present = len(recent_news) > 0
 
-    # ── Signal logic ───────────────────────────────
     s1_price  = price < MAX_PRICE
     s1_vol    = avg_vol_30 > MIN_AVG_VOLUME
     s1_mcap   = market_cap > MIN_MARKET_CAP
@@ -181,25 +171,14 @@ def analyze(ticker: str):
         "ma30": ma30,
         "spread_pct": 0,
         "gain_5d_pct": round(gain_5d * 100, 2),
+        "chart_closes": [round(c, 4) for c in closes],
+        "chart_dates":  chart_dates,
         "steps": {
-            "screen": {
-                "passed": passes_screen,
-                "checks": {"price_ok": s1_price, "volume_ok": s1_vol, "mcap_ok": s1_mcap}
-            },
-            "volume_surge": {
-                "passed": step2_pass,
-                "checks": {"vol_spike": vol_spike, "price_up": price_up}
-            },
-            "momentum": {
-                "passed": step3_pass,
-                "checks": {"above_ma10": above_ma10, "ma10_vs_30": ma10_vs_30, "rsi_ok": rsi_ok}
-            },
-            "catalyst": {"passed": catalyst_present, "news": recent_news},
-            "risk": {
-                "passed": len(disqualifiers) == 0,
-                "disqualifiers": disqualifiers,
-                "checks": {"spread_ok": True, "no_pump": no_pump}
-            }
+            "screen":       {"passed": passes_screen, "checks": {"price_ok": s1_price, "volume_ok": s1_vol, "mcap_ok": s1_mcap}},
+            "volume_surge": {"passed": step2_pass,    "checks": {"vol_spike": vol_spike, "price_up": price_up}},
+            "momentum":     {"passed": step3_pass,    "checks": {"above_ma10": above_ma10, "ma10_vs_30": ma10_vs_30, "rsi_ok": rsi_ok}},
+            "catalyst":     {"passed": catalyst_present, "news": recent_news},
+            "risk":         {"passed": len(disqualifiers) == 0, "disqualifiers": disqualifiers, "checks": {"spread_ok": True, "no_pump": no_pump}}
         },
         "signal_strength": signal_strength,
         "max_signal": 7,
