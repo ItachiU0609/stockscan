@@ -15,7 +15,6 @@ import time
 
 app = FastAPI(title="Penny Stock Screener")
 
-# Allow all origins for local / hosted use
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,7 +22,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve the frontend at /
 app.mount("/static", StaticFiles(directory="."), name="static")
 
 @app.get("/")
@@ -71,7 +69,7 @@ def analyze(ticker: str):
     ticker = ticker.upper().strip()
     time.sleep(1)
 
-     try:
+    try:
         tk   = yf.Ticker(ticker)
         info = tk.info
         hist = tk.history(period="3mo")
@@ -100,7 +98,6 @@ def analyze(ticker: str):
     ma30        = moving_average(closes, 30)
     vol_ratio   = round(today_vol / avg_vol_30, 2) if avg_vol_30 > 0 else 0
 
-    # ── Step results ────────────────────────────
     s1_price  = price < MAX_PRICE
     s1_vol    = avg_vol_30 > MIN_AVG_VOLUME
     s1_mcap   = market_cap > MIN_MARKET_CAP
@@ -134,8 +131,8 @@ def analyze(ticker: str):
 
     signal_strength = 0
     if passes_screen:
-        if step2_pass:      signal_strength += 2
-        if step3_pass:      signal_strength += 2
+        if step2_pass:       signal_strength += 2
+        if step3_pass:       signal_strength += 2
         if catalyst_present: signal_strength += 3
 
     buy_signal = signal_strength >= 5 and len(disqualifiers) == 0 and passes_screen
@@ -153,8 +150,6 @@ def analyze(ticker: str):
         "ma30": ma30,
         "spread_pct": round(spread_pct * 100, 2),
         "gain_5d_pct": round(gain_5d * 100, 2),
-
-        # Step results
         "steps": {
             "screen": {
                 "passed": passes_screen,
@@ -192,11 +187,9 @@ def analyze(ticker: str):
                 }
             }
         },
-
         "signal_strength": signal_strength,
         "max_signal": 7,
         "buy_signal": buy_signal,
-
         "trade": {
             "entry":       price,
             "stop_loss":   round(price * (1 - STOP_LOSS_PCT), 4),
