@@ -1,7 +1,7 @@
 """
-Penny Stock Screener — FastAPI Backend
-======================================
-Install:  pip install fastapi uvicorn yfinance
+Penny Stock Screener — FastAPI Backend (Alpha Vantage)
+=======================================================
+Install:  pip install fastapi uvicorn requests
 Run:      uvicorn main:app --host 0.0.0.0 --port 8000
 """
 
@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from datetime import datetime, timedelta
-import yfinance as yf
+import requests
 import time
 
 app = FastAPI(title="Penny Stock Screener")
@@ -28,6 +28,10 @@ app.mount("/static", StaticFiles(directory="."), name="static")
 def root():
     return FileResponse("index.html")
 
+
+# ── Config ──────────────────────────────────────
+AV_KEY             = "U43YOPH57TT4JX57"
+AV_BASE            = "https://www.alphavantage.co/query"
 
 # ── Thresholds ──────────────────────────────────
 MAX_PRICE          = 5.00
@@ -64,76 +68,109 @@ def moving_average(prices, n):
     return round(sum(prices[-n:]) / n, 4)
 
 
+def av_get(params: dict):
+    params["apikey"] = AV_KEY
+    r = requests.get(AV_BASE, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+
 @app.get("/api/analyze/{ticker}")
 def analyze(ticker: str):
     ticker = ticker.upper().strip()
-    time.sleep(1)
 
+    # ── Daily price history ──────────────────────
     try:
-        tk   = yf.Ticker(ticker)
-        info = tk.info
-        hist = tk.history(period="3mo")
+        daily = av_get({
+            "function": "TIME_SERIES_DAILY",
+            "symbol": ticker,
+            "outputsize": "compact"
+        })
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Price fetch failed: {e}")
 
-    if hist.empty or len(hist) < 2:
-        raise HTTPException(status_code=404, detail=f"No data found for {ticker}")
+    if "Time Series (Daily)" not in daily:
+        msg = daily.get("Note") or daily.get("Information") or "No data returned"
+        raise HTTPException(status_code=404, detail=msg)
 
-    closes  = list(hist["Close"])
-    volumes = list(hist["Volume"])
+    ts = daily["Time Series (Daily)"]
+    dates   = sorted(ts.keys(), reverse=True)[:63]  # ~3 months
+    closes  = [float(ts[d]["4. close"]) for d in dates]
+    volumes = [float(ts[d]["5. volume"]) for d in dates]
 
-    price       = round(closes[-1], 4)
-    prev_close  = closes[-2]
-    today_vol   = int(volumes[-1])
-    avg_vol_30  = sum(volumes[-30:]) / min(len(volumes), 30)
-    market_cap  = info.get("marketCap", 0) or 0
-    bid         = info.get("bid", 0) or 0
-    ask         = info.get("ask", price) or price
-    spread_pct  = ((ask - bid) / ask) if ask > 0 else 0
-    price_chg   = (price - prev_close) / prev_close if prev_close else 0
-    price_5d    = closes[-6] if len(closes) >= 6 else closes[0]
-    gain_5d     = (price - price_5d) / price_5d if price_5d else 0
-    rsi         = compute_rsi(closes)
-    ma10        = moving_average(closes, 10)
-    ma30        = moving_average(closes, 30)
-    vol_ratio   = round(today_vol / avg_vol_30, 2) if avg_vol_30 > 0 else 0
+    # Most recent = index 0 (reverse sorted)
+    price      = round(closes[0], 4)
+    prev_close = closes[1]
+    today_vol  = int(volumes[0])
+    avg_vol_30 = sum(volumes[:30]) / min(len(volumes), 30)
+    vol_ratio  = round(today_vol / avg_vol_30, 2) if avg_vol_30 > 0 else 0
+    price_chg  = (price - prev_close) / prev_close if prev_close else 0
+    price_5d   = closes[5] if len(closes) >= 6 else closes[-1]
+    gain_5d    = (price - price_5d) / price_5d if price_5d else 0
+    rsi        = compute_rsi(list(reversed(closes)))  # oldest first for RSI
+    ma10       = moving_average(list(reversed(closes)), 10)
+    ma30       = moving_average(list(reversed(closes)), 30)
 
+    # ── Company overview ─────────────────────────
+    time.sleep(1)  # avoid hitting rate limit between calls
+    try:
+        overview = av_get({
+            "function": "OVERVIEW",
+            "symbol": ticker
+        })
+        market_cap = float(overview.get("MarketCapitalization", 0) or 0)
+    except Exception:
+        market_cap = 0
+
+    # Alpha Vantage doesn't provide bid/ask on free tier
+    spread_pct = 0.0
+
+    # ── News ─────────────────────────────────────
+    time.sleep(1)
+    try:
+        news_data = av_get({
+            "function": "NEWS_SENTIMENT",
+            "tickers": ticker,
+            "limit": "5"
+        })
+        feed = news_data.get("feed", [])
+        cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y%m%dT%H%M%S")
+        recent_news = [
+            {"title": n.get("title", ""), "url": n.get("url", "")}
+            for n in feed
+            if n.get("time_published", "") >= cutoff
+        ][:3]
+    except Exception:
+        recent_news = []
+
+    catalyst_present = len(recent_news) > 0
+
+    # ── Signal logic ─────────────────────────────
     s1_price  = price < MAX_PRICE
     s1_vol    = avg_vol_30 > MIN_AVG_VOLUME
     s1_mcap   = market_cap > MIN_MARKET_CAP
     passes_screen = s1_price and s1_vol and s1_mcap
 
-    vol_spike   = vol_ratio >= VOLUME_SPIKE_RATIO
-    price_up    = price_chg >= MIN_PRICE_CHANGE
-    step2_pass  = vol_spike and price_up
+    vol_spike  = vol_ratio >= VOLUME_SPIKE_RATIO
+    price_up   = price_chg >= MIN_PRICE_CHANGE
+    step2_pass = vol_spike and price_up
 
-    above_ma10  = (price > ma10)  if ma10  else False
-    ma10_vs_30  = (ma10 > ma30)   if (ma10 and ma30) else False
-    rsi_ok      = (RSI_LOW <= rsi <= RSI_HIGH) if rsi else False
-    step3_pass  = above_ma10 and ma10_vs_30 and rsi_ok
+    above_ma10 = (price > ma10) if ma10 else False
+    ma10_vs_30 = (ma10 > ma30)  if (ma10 and ma30) else False
+    rsi_ok     = (RSI_LOW <= rsi <= RSI_HIGH) if rsi else False
+    step3_pass = above_ma10 and ma10_vs_30 and rsi_ok
 
-    news = tk.news or []
-    recent_news = [
-        {"title": n.get("title", ""), "url": n.get("link", "")}
-        for n in news
-        if n.get("providerPublishTime", 0) >
-           (datetime.now() - timedelta(days=7)).timestamp()
-    ][:3]
-    catalyst_present = len(recent_news) > 0
-
-    spread_ok = spread_pct <= MAX_SPREAD_PCT
+    spread_ok = True  # no bid/ask on free tier, skip this check
     no_pump   = gain_5d <= PUMP_THRESHOLD
     disqualifiers = []
-    if not spread_ok:
-        disqualifiers.append(f"Bid/ask spread too wide ({spread_pct*100:.1f}%)")
     if not no_pump:
         disqualifiers.append(f"Possible pump-and-dump (+{gain_5d*100:.0f}% in 5 days)")
 
     signal_strength = 0
     if passes_screen:
-        if step2_pass:       signal_strength += 2
-        if step3_pass:       signal_strength += 2
-        if catalyst_present: signal_strength += 3
+        if step2_pass:        signal_strength += 2
+        if step3_pass:        signal_strength += 2
+        if catalyst_present:  signal_strength += 3
 
     buy_signal = signal_strength >= 5 and len(disqualifiers) == 0 and passes_screen
 
@@ -169,9 +206,9 @@ def analyze(ticker: str):
             "momentum": {
                 "passed": step3_pass,
                 "checks": {
-                    "above_ma10":  above_ma10,
-                    "ma10_vs_30":  ma10_vs_30,
-                    "rsi_ok":      rsi_ok,
+                    "above_ma10": above_ma10,
+                    "ma10_vs_30": ma10_vs_30,
+                    "rsi_ok":     rsi_ok,
                 }
             },
             "catalyst": {
