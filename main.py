@@ -30,7 +30,7 @@ def root():
 
 
 # ── Config ──────────────────────────────────────
-AV_KEY             = "U43YOPH57TT4JX57"
+AV_KEY             = "9BMIN6QQZDHBROA9"
 AV_BASE            = "https://www.alphavantage.co/query"
 
 # ── Thresholds ──────────────────────────────────
